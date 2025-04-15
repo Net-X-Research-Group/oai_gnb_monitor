@@ -177,7 +177,7 @@ int main(int argc, char* argv[]) {
     if (argc > 1) {
         outputFile = argv[1];
     }
-    freopen("../gnb.log", "r", stdin); // FOR TESTING
+    //freopen("../xxx.log", "r", stdin); // FOR TESTING
     while(std::getline(std::cin, line)) {
         if (!line.empty()) {
             try {
