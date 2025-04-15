@@ -1,3 +1,4 @@
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <regex>
@@ -46,10 +47,10 @@ struct UEData{
 
 class Parser {
 private:
-    std::map<std::string, UEData> ue_data;
+    std::map<std::string, std::vector<UEData>> ue_data_by_rnti;
+    std::map<std::string, UEData> temp_ue_data;
 
     // Define regex patterns as class members to compile them once
-    std::regex frame_slot_pattern;
     std::regex ue_basic_pattern;
     std::regex ue_indicators_1;
     std::regex ue_indicators_2;
@@ -58,7 +59,6 @@ private:
 
 public:
     Parser() :
-            frame_slot_pattern(R"(\[NR_MAC\]\s+Frame\.Slot\s+(\d+)\.(\d+))"),
             ue_basic_pattern(R"(UE RNTI (\w+) CU-UE-ID (\d+) (\w+-\w+) PH (\d+) dB PCMAX (\d+) dBm, average RSRP (-?\d+))"),
             ue_indicators_1(R"(UE (\w+): CQI (\d+), RI (\d+))"),
             ue_indicators_2(R"(UE (\w+): UL-RI (\d+))"),
@@ -67,10 +67,17 @@ public:
     {}
 
     void create_ue_data(const std::string& rnti) {
-        if (ue_data.find(rnti) == ue_data.end()) {
-            ue_data[rnti] = UEData();
-            ue_data[rnti].rnti = rnti;
+        if (temp_ue_data.find(rnti) == temp_ue_data.end()) {
+            temp_ue_data[rnti] = UEData();
+            temp_ue_data[rnti].rnti = rnti;
+            temp_ue_data[rnti].timestamp = std::time(nullptr);
         }
+    }
+
+    void store_data(const std::string& rnti) {
+        UEData& data = temp_ue_data[rnti];
+        ue_data_by_rnti[rnti].push_back(data);
+        temp_ue_data.erase(rnti);
     }
 
     void parse_line(const std::string& line) {
@@ -79,53 +86,84 @@ public:
 
         if (std::regex_search(line, matches, ue_basic_pattern)) {
             rnti = matches[1];
-
             create_ue_data(rnti);
-
-            ue_data[rnti].timestamp = std::time(nullptr);
-            ue_data[rnti].ue_id = std::stoi(matches[2]);
-            ue_data[rnti].state = matches[3];
-            ue_data[rnti].ph = std::stoi(matches[4]);
-            ue_data[rnti].rsrp = std::stoi(matches[5]);
+            temp_ue_data[rnti].timestamp = std::time(nullptr);
+            temp_ue_data[rnti].ue_id = std::stoi(matches[2]);
+            temp_ue_data[rnti].state = matches[3];
+            temp_ue_data[rnti].ph = std::stoi(matches[4]);
+            temp_ue_data[rnti].rsrp = std::stoi(matches[5]);
         }
 
         else if (std::regex_search(line, matches, ue_indicators_1)) {
             rnti = matches[1];
-            create_ue_data(rnti);
-            ue_data[rnti].cqi = std::stoi(matches[2]);
-            ue_data[rnti].dl_ri = std::stoi(matches[3]);
+            temp_ue_data[rnti].cqi = std::stoi(matches[2]);
+            temp_ue_data[rnti].dl_ri = std::stoi(matches[3]);
         }
 
         else if(std::regex_search(line, matches, ue_indicators_2)) {
             rnti = matches[1];
-            create_ue_data(rnti);
-            ue_data[rnti].ul_ri = std::stoi(matches[2]);
+            temp_ue_data[rnti].ul_ri = std::stoi(matches[2]);
         }
 
         else if(std::regex_search(line, matches, dl_phy)) {
             rnti = matches[1];
-            create_ue_data(rnti);
-
-            ue_data[rnti].dlsch_err = std::stoi(matches[2]);
-            ue_data[rnti].pucch_dtx = std::stoi(matches[3]);
-            ue_data[rnti].dl_bler = std::stod(matches[4]);
-            ue_data[rnti].dl_mcs = std::stoi(matches[5]);
+            temp_ue_data[rnti].dlsch_err = std::stoi(matches[2]);
+            temp_ue_data[rnti].pucch_dtx = std::stoi(matches[3]);
+            temp_ue_data[rnti].dl_bler = std::stod(matches[4]);
+            temp_ue_data[rnti].dl_mcs = std::stoi(matches[5]);
         }
 
         else if(std::regex_search(line, matches, ul_phy)) {
             rnti = matches[1];
-            create_ue_data(rnti);
+            temp_ue_data[rnti].ulsch_err = std::stoi(matches[2]);
+            temp_ue_data[rnti].ulsch_dtx = std::stoi(matches[3]);
+            temp_ue_data[rnti].ul_bler = std::stod(matches[4]);
+            temp_ue_data[rnti].ul_mcs = std::stoi(matches[5]);
 
-            ue_data[rnti].ulsch_err = std::stoi(matches[2]);
-            ue_data[rnti].ulsch_dtx = std::stoi(matches[3]);
-            ue_data[rnti].ul_bler = std::stod(matches[4]);
-            ue_data[rnti].ul_mcs = std::stoi(matches[5]);
-
-            ue_data[rnti].nprb = std::stoi(matches[6]);
-            ue_data[rnti].snr = std::stod(matches[7]);
+            temp_ue_data[rnti].nprb = std::stoi(matches[6]);
+            temp_ue_data[rnti].snr = std::stod(matches[7]);
+            store_data(rnti);
         }
-
         else {;}
+    }
+
+
+    void exportToCSV(const std::string& filename) {
+        std::ofstream csvFile(filename);
+
+        // Write CSV header
+        csvFile << "timestamp,rnti,ue_id,state,ph,pcmax,rsrp,cqi,dl_ri,ul_ri,";
+        csvFile << "dlsch_err,pucch_dtx,dl_bler,dl_mcs,ulsch_err,ulsch_dtx,";
+        csvFile << "ul_bler,ul_mcs,nprb,snr" << std::endl;
+
+        for (const auto& [rnti, records] : ue_data_by_rnti) {
+            for (const auto& data : records) {
+                char timeBuffer[30];
+                strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%d %H:%M:%S", localtime(&data.timestamp));
+                // Write data row for this RNTI
+                csvFile << timeBuffer << ","
+                << data.rnti << ","
+                << data.ue_id << ","
+                << data.state << ","
+                << data.ph << ","
+                << data.pcmax << ","
+                << data.rsrp << ","
+                << data.cqi << ","
+                << data.dl_ri << ","
+                << data.ul_ri << ","
+                << data.dlsch_err << ","
+                << data.pucch_dtx << ","
+                << data.ulsch_err << ","
+                << data.ulsch_dtx << ","
+                << data.dl_bler << ","
+                << data.dl_mcs << ","
+                << data.ul_bler << ","
+                << data.ul_mcs << ","
+                << data.nprb << ","
+                << data.snr << std::endl;
+            }
+        }
+        csvFile.close();
     }
 };
 
@@ -139,7 +177,7 @@ int main(int argc, char* argv[]) {
     if (argc > 1) {
         outputFile = argv[1];
     }
-
+    freopen("../gnb.log", "r", stdin); // FOR TESTING
     while(std::getline(std::cin, line)) {
         if (!line.empty()) {
             try {
@@ -150,4 +188,5 @@ int main(int argc, char* argv[]) {
             }
         }
     }
+    parser.exportToCSV(outputFile);
 }

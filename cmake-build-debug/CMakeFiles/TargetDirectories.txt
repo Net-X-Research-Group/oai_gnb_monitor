@@ -1,3 +1,0 @@
-/Users/roberthayek/CLionProjects/gnb_parser/cmake-build-debug/CMakeFiles/gnb_parser.dir
-/Users/roberthayek/CLionProjects/gnb_parser/cmake-build-debug/CMakeFiles/edit_cache.dir
-/Users/roberthayek/CLionProjects/gnb_parser/cmake-build-debug/CMakeFiles/rebuild_cache.dir
