@@ -3,7 +3,11 @@
 #include <string>
 #include <regex>
 #include <map>
-
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
 
 /* Example Frame Slot format
  *
@@ -21,31 +25,91 @@
  */
 
 
-struct UEData {
+struct UEData{
     std::string rnti; // UE ID
     std::string state; // In-sync or Out-of-sync
-    double rsrp; // Reference Signals Received Power (DOWNLINK)
-    int pcmax; // Maximum UL Channel Transmit Power (dBm)
-    int ue_id; // User Equipment ID
-    int ph; // Power Headroom
-    int cqi; // Channel Quality Index
-    int dl_ri; // Downlink Rank Indicator
-    int ul_ri; // Uplink Rank Indicator
-    int dlsch_err; // Downlink Scheduling Errors
-    int pucch_dtx; // PUCCH Discontinuous Transmission
-    double dl_bler; // Downlink Block Error Rate
-    int dl_mcs; // Downlink MCS
-    int ulsch_err; // Uplink Scheduling Errors
-    int ulsch_dtx; // Uplink Scheduling Discontinuous Transmissions
-    double ul_bler; // Uplink Block Error Rate
-    int ul_mcs; // Uplink MCS
-    int nprb; // Number of PRB
-    double snr; // Signal to Noise
-    time_t timestamp; // Timestamp
+    double rsrp{}; // Reference Signals Received Power (DOWNLINK)
+    int pcmax{}; // Maximum UL Channel Transmit Power (dBm)
+    int ue_id{}; // User Equipment ID
+    int ph{}; // Power Headroom
+    int cqi{}; // Channel Quality Index
+    int dl_ri{}; // Downlink Rank Indicator
+    int ul_ri{}; // Uplink Rank Indicator
+    int dlsch_err{}; // Downlink Scheduling Errors
+    int pucch_dtx{}; // PUCCH Discontinuous Transmission
+    double dl_bler{}; // Downlink Block Error Rate
+    int dl_mcs{}; // Downlink MCS
+    int ulsch_err{}; // Uplink Scheduling Errors
+    int ulsch_dtx{}; // Uplink Scheduling Discontinuous Transmissions
+    double ul_bler{}; // Uplink Block Error Rate
+    int ul_mcs{}; // Uplink MCS
+    int nprb{}; // Number of PRB
+    double snr{}; // Signal to Noise
+    time_t timestamp{}; // Timestamp
 };
+
+template <typename T>
+class SafeQueue {
+private:
+    std::queue<T> queue;
+    mutable std::mutex mtx;
+    std::condition_variable cv;
+    bool done;
+
+public:
+    SafeQueue() : done(false) {}
+
+    void push(T value) {
+        std::lock_guard lock(mtx);
+        queue.push(std::move(value));
+        cv.notify_one();
+    }
+
+    bool attempt_pop(T& value) {
+        std::lock_guard lock(mtx);
+        if (queue.empty()) {
+            return false;
+        }
+        value = std::move(queue.front());
+        queue.pop();
+        return true;
+    }
+
+    void wait_pop(T& value) {
+        std::unique_lock lock(mtx);
+        cv.wait(lock, [this]{return !queue.empty() || done;});
+        if (done && queue.empty()) {
+            return;
+        }
+        value = std::move(queue.front());
+        queue.pop();
+    }
+
+    void set_done() {
+        std::lock_guard lock(mtx);
+        done = true;
+        cv.notify_all();
+    }
+
+    bool is_empty() {
+        std::lock_guard lock(mtx);
+        return queue.empty();
+    }
+};
+
 
 class Parser {
 private:
+    SafeQueue<std::string> line_queue;
+    SafeQueue<UEData> data_queue;
+
+    std::mutex combined_mtx;
+    std::mutex ue_file_mtx;
+
+    // Data Queue
+    std::atomic<bool> done;
+
+
     std::map<std::string, std::ofstream> ue_file_handler;
     std::ofstream combined_file;
     bool export_combined;
@@ -62,41 +126,104 @@ private:
     std::regex ul_phy;
 
 public:
-    explicit Parser(const std::string &file_name, bool exportCombined = true) : filename(file_name),
+    explicit Parser(std::string file_name, const bool exportCombined = true) :
         export_combined(exportCombined),
+        filename(std::move(file_name)),
 
         ue_basic_pattern(R"(UE RNTI (\w+) CU-UE-ID (\d+) (\w+-\w+) PH (\d+) dB PCMAX (\d+) dBm, average RSRP (-?\d+))"),
         ue_indicators_1(R"(UE (\w+): CQI (\d+), RI (\d+))"),
         ue_indicators_2(R"(UE (\w+): UL-RI (\d+))"),
         dl_phy(R"(UE (\w+):.+ dlsch_errors (\d+), pucch0_DTX (\d+), BLER ([0-9.]+) MCS .+ (\d+))"),
-        ul_phy(
-            R"(UE (\w+):.+ ulsch_errors (\d+), ulsch_DTX (\d+), BLER ([0-9.]+) MCS \(1\) (\d+) .+ NPRB (\d+)  SNR ([0-9.]+))") {
-        if (export_combined) {
-            combined_file.open(filename + ".csv", std::ios::binary);
-            std::vector<char> buffer(1024 * 1024);
-            combined_file.rdbuf()->pubsetbuf(buffer.data(), buffer.size());
+        ul_phy(R"(UE (\w+):.+ ulsch_errors (\d+), ulsch_DTX (\d+), BLER ([0-9.]+) MCS \(1\) (\d+) .+ NPRB (\d+)  SNR ([0-9.]+))")
+    {
+        done = false;
+    }
 
-            // Write CSV header
-            combined_file << "timestamp,rnti,ue_id,state,ph,pcmax,rsrp,cqi,dl_ri,ul_ri,"
-                    << "dlsch_err,pucch_dtx,dl_bler,dl_mcs,ulsch_err,ulsch_dtx,"
-                    << "ul_bler,ul_mcs,nprb,snr" << std::endl;
+    void parse_line(const std::string& line) {
+        std::smatch matches;
+        std::string rnti;
+
+        if (std::regex_search(line, matches, ue_basic_pattern)) {
+            rnti = matches[1];
+            create_ue_data(rnti);
+            temp_ue_data[rnti].timestamp = std::time(nullptr);
+            temp_ue_data[rnti].ue_id = std::stoi(matches[2]);
+            temp_ue_data[rnti].state = matches[3];
+            temp_ue_data[rnti].ph = std::stoi(matches[4]);
+            temp_ue_data[rnti].rsrp = std::stoi(matches[5]);
+        }
+
+        else if (std::regex_search(line, matches, ue_indicators_1)) {
+            rnti = matches[1];
+            temp_ue_data[rnti].cqi = std::stoi(matches[2]);
+            temp_ue_data[rnti].dl_ri = std::stoi(matches[3]);
+        }
+
+        else if(std::regex_search(line, matches, ue_indicators_2)) {
+            rnti = matches[1];
+            temp_ue_data[rnti].ul_ri = std::stoi(matches[2]);
+        }
+
+        else if(std::regex_search(line, matches, dl_phy)) {
+            rnti = matches[1];
+            temp_ue_data[rnti].dlsch_err = std::stoi(matches[2]);
+            temp_ue_data[rnti].pucch_dtx = std::stoi(matches[3]);
+            temp_ue_data[rnti].dl_bler = std::stod(matches[4]);
+            temp_ue_data[rnti].dl_mcs = std::stoi(matches[5]);
+        }
+
+        else if(std::regex_search(line, matches, ul_phy)) {
+            rnti = matches[1];
+            temp_ue_data[rnti].ulsch_err = std::stoi(matches[2]);
+            temp_ue_data[rnti].ulsch_dtx = std::stoi(matches[3]);
+            temp_ue_data[rnti].ul_bler = std::stod(matches[4]);
+            temp_ue_data[rnti].ul_mcs = std::stoi(matches[5]);
+
+            temp_ue_data[rnti].nprb = std::stoi(matches[6]);
+            temp_ue_data[rnti].snr = std::stod(matches[7]);
+            //store_data(rnti);
+            data_queue.push(temp_ue_data[rnti]);
+        }
+        else {;}
+    }
+
+    void reader_thread_func(std::istream& input) {
+        std::string line;
+        while (std::getline(input, line)) {
+            if (!line.empty()) {
+                line_queue.push(line);
+            }
+        }
+        line_queue.set_done();
+    }
+
+    void parser_thread_func() {
+        std::string line;
+        while (true) {
+            line_queue.wait_pop(line);
+            if (line_queue.is_empty() && done) break;
+            try {
+                parse_line(line);
+            } catch (const std::exception& e) {
+                std::cerr << "Error parsing line: " << line << std::endl;
+                std::cerr << "Exception: " << e.what() << std::endl;
+            }
+        }
+        data_queue.set_done();
+    }
+
+    void writer_thread_func() {
+        UEData data;
+        while (true) {
+            data_queue.wait_pop(data);
+            if (done && data_queue.is_empty()) break;
+            store_data(data);
         }
     }
 
-    ~Parser() {
+    void store_data(const UEData& data) {
         if (export_combined) {
-            combined_file.close();
-        }
-
-        for (auto &[rnti, file]: ue_file_handler) {
-            file.close();
-        }
-    }
-
-    void store_data(const std::string &rnti) {
-        UEData &data = temp_ue_data[rnti];
-
-        if (export_combined) {
+            std::lock_guard lock(combined_mtx);
             char timeBuffer[300];
             strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%d %H:%M:%S", localtime(&data.timestamp));
             combined_file << timeBuffer << ","
@@ -122,24 +249,25 @@ public:
         }
 
         if (!export_combined) {
+            std::lock_guard lock(ue_file_mtx);
             // If the file handler doesn't exist yet, create it
-            if (ue_file_handler.find(rnti) == ue_file_handler.end()) {
-                std::string ueFile = filename + "_" + rnti + ".csv";
-                ue_file_handler[rnti].open(ueFile, std::ios::binary);
-                std::vector<char> buffer(1024 * 1024);
-                ue_file_handler[rnti].rdbuf()->pubsetbuf(buffer.data(), buffer.size());
+            if (ue_file_handler.find(data.rnti) == ue_file_handler.end()) {
+                const std::string ueFile = filename + "_" + data.rnti + ".csv";
+                ue_file_handler[data.rnti].open(ueFile, std::ios::binary);
+                std::vector<char> buffer(1024*1024);
+                ue_file_handler[data.rnti].rdbuf()->pubsetbuf(buffer.data(), buffer.size());
 
                 // Write header to the new file
-                ue_file_handler[rnti] << "timestamp,rnti,ue_id,state,ph,pcmax,rsrp,cqi,dl_ri,ul_ri,"
-                        << "dlsch_err,pucch_dtx,dl_bler,dl_mcs,ulsch_err,ulsch_dtx,"
-                        << "ul_bler,ul_mcs,nprb,snr" << std::endl;
+                ue_file_handler[data.rnti] << "timestamp,rnti,ue_id,state,ph,pcmax,rsrp,cqi,dl_ri,ul_ri,"
+                            << "dlsch_err,pucch_dtx,dl_bler,dl_mcs,ulsch_err,ulsch_dtx,"
+                            << "ul_bler,ul_mcs,nprb,snr" << std::endl;
             }
 
             // Write the data
             char timeBuffer[30];
             strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%d %H:%M:%S", localtime(&data.timestamp));
 
-            ue_file_handler[rnti] << timeBuffer << ","
+            ue_file_handler[data.rnti] << timeBuffer << ","
                     << data.rnti << ","
                     << data.ue_id << ","
                     << data.state << ","
@@ -162,79 +290,40 @@ public:
         }
 
         // Only clear this RNTI's data
-        temp_ue_data.erase(rnti);
+        temp_ue_data.erase(data.rnti);
     }
 
-    void create_ue_data(const std::string &rnti) {
+    void create_ue_data(const std::string& rnti) {
         if (temp_ue_data.find(rnti) == temp_ue_data.end()) {
             temp_ue_data[rnti] = UEData();
             temp_ue_data[rnti].rnti = rnti;
             temp_ue_data[rnti].timestamp = std::time(nullptr);
         }
     }
-
-    void parse_line(const std::string &line) {
-        std::smatch matches;
-        std::string rnti;
-
-        if (std::regex_search(line, matches, ue_basic_pattern)) {
-            rnti = matches[1];
-            create_ue_data(rnti);
-            temp_ue_data[rnti].timestamp = std::time(nullptr);
-            temp_ue_data[rnti].ue_id = std::stoi(matches[2]);
-            temp_ue_data[rnti].state = matches[3];
-            temp_ue_data[rnti].ph = std::stoi(matches[4]);
-            temp_ue_data[rnti].rsrp = std::stoi(matches[5]);
-        } else if (std::regex_search(line, matches, ue_indicators_1)) {
-            rnti = matches[1];
-            temp_ue_data[rnti].cqi = std::stoi(matches[2]);
-            temp_ue_data[rnti].dl_ri = std::stoi(matches[3]);
-        } else if (std::regex_search(line, matches, ue_indicators_2)) {
-            rnti = matches[1];
-            temp_ue_data[rnti].ul_ri = std::stoi(matches[2]);
-        } else if (std::regex_search(line, matches, dl_phy)) {
-            rnti = matches[1];
-            temp_ue_data[rnti].dlsch_err = std::stoi(matches[2]);
-            temp_ue_data[rnti].pucch_dtx = std::stoi(matches[3]);
-            temp_ue_data[rnti].dl_bler = std::stod(matches[4]);
-            temp_ue_data[rnti].dl_mcs = std::stoi(matches[5]);
-        } else if (std::regex_search(line, matches, ul_phy)) {
-            rnti = matches[1];
-            temp_ue_data[rnti].ulsch_err = std::stoi(matches[2]);
-            temp_ue_data[rnti].ulsch_dtx = std::stoi(matches[3]);
-            temp_ue_data[rnti].ul_bler = std::stod(matches[4]);
-            temp_ue_data[rnti].ul_mcs = std::stoi(matches[5]);
-
-            temp_ue_data[rnti].nprb = std::stoi(matches[6]);
-            temp_ue_data[rnti].snr = std::stod(matches[7]);
-            store_data(rnti);
-        } else { ; }
-    }
 };
 
 
-int main(int argc, char *argv[]) {
+int main(const int argc, char* argv[]) {
     std::string line;
-    std::string outputFile = "ue_metrics";
+    const std::string outputFile = "ue_metrics";
     bool exportCombined = true;
 
     for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "--sep") {
+        if (std::string arg = argv[i]; arg == "--sep") {
             exportCombined = false;
         }
     }
 
     //freopen("gnb_fed3.log", "r", stdin); // FOR TESTING
     Parser parser(outputFile, exportCombined);
-    while (std::getline(std::cin, line)) {
-        if (!line.empty()) {
-            try {
-                parser.parse_line(line);
-            } catch (const std::exception &e) {
-                std::cerr << "Error parsing line: " << line << std::endl;
-                std::cerr << "Exception: " << e.what() << std::endl;
-            }
-        }
-    }
+
+    std::thread reader(&Parser::reader_thread_func, &parser, std::ref(std::cin));
+    std::thread processor(&Parser::parser_thread_func, &parser);
+    std::thread writer(&Parser::writer_thread_func, &parser);
+
+
+    reader.join();
+    processor.join();
+    writer.join();
+
 }
