@@ -184,7 +184,8 @@ public:
             temp_ue_data[rnti].ue_id = std::stoi(matches[2]);
             temp_ue_data[rnti].state = matches[3];
             temp_ue_data[rnti].ph = std::stoi(matches[4]);
-            temp_ue_data[rnti].rsrp = std::stoi(matches[5]);
+            temp_ue_data[rnti].pcmax = std::stoi(matches[5]);
+            temp_ue_data[rnti].rsrp = std::stoi(matches[6]);
         } else if (std::regex_search(line, matches, ue_indicators_1)) {
             rnti = matches[1];
             temp_ue_data[rnti].cqi = std::stoi(matches[2]);
