@@ -31,10 +31,9 @@ jobs:
       # Build your program with the given configuration
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}}
 
-     # Upload the compiled binary as an artifact
     - name: Upload Build Artifact
       uses: actions/upload-artifact@v4
       with:
-       name: ${{ env.BINARY_NAME }}
-       path: ${{github.workspace}}/build/${{ env.BINARY_NAME }}
+       name: gnb_parser
+       path: ${{github.workspace}}/build/gnb_parser
        retention-days: 7
